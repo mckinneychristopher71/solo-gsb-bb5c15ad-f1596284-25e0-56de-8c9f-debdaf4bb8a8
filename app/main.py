@@ -7,6 +7,7 @@ POST   /api/analyses/{id}/simulate           preview add/replace/remove changes 
 POST   /api/analyses/{id}/merge-precheck     precheck merging two change batches on one base version
 POST   /api/analyses/{id}/quarantine-plan    deterministic deny-rule plan that quarantines one CIDR (preview only)
 POST   /api/analyses/{id}/traffic-audit      attribute observed access records to winning rules (read-only)
+POST   /api/analyses/{id}/observation-correction minimum keep/disable/flip plan making observations hit expected actions (read-only)
 GET    /api/analyses                         list saved analysis versions
 GET    /api/analyses/{id}                    fetch one version with the full result
 GET    /api/analyses/{id}/rules              query rules (filters: status/action/ip_version)
@@ -39,6 +40,7 @@ from .change_guard import ChangeGuardError, guard_changes, parse_guard_entries
 from .decision_map import DecisionMapError, build_decision_map, parse_query_cidr
 from .diff import ANALYSIS_ID_RE, diff_analyses
 from .merge_precheck import build_batch, merge_precheck
+from .observation_correction import ObservationCorrectionError, correct_observations
 from .quarantine_plan import QuarantinePlanError, plan_quarantine
 from .redundant import redundant_rule_inventory
 from .schemas import (
@@ -46,6 +48,7 @@ from .schemas import (
     AnalyzeRequest,
     ChangeGuardRequest,
     MergePrecheckRequest,
+    ObservationCorrectionRequest,
     QuarantinePlanRequest,
     SimulateRequest,
     TrafficAuditRequest,
@@ -114,6 +117,20 @@ async def _traffic_audit_error_handler(_request, exc: TrafficAuditError):
     return JSONResponse(
         status_code=400,
         content={"error": "invalid_traffic_audit", "detail": str(exc), "issues": exc.issues},
+    )
+
+
+@app.exception_handler(ObservationCorrectionError)
+async def _observation_correction_error_handler(_request, exc: ObservationCorrectionError):
+    # The whole request is rejected; every offending candidate/observation is
+    # reported at once.
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": "invalid_observation_correction",
+            "detail": str(exc),
+            "issues": exc.issues,
+        },
     )
 
 
@@ -320,6 +337,36 @@ def traffic_audit_records(analysis_id: str, req: TrafficAuditRequest) -> dict[st
         raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
 
     return audit_traffic(base, [r.model_dump() for r in req.records])
+
+
+@app.post("/api/analyses/{analysis_id}/observation-correction", status_code=200)
+def correct_observation_policy(
+    analysis_id: str, req: ObservationCorrectionRequest
+) -> dict[str, Any]:
+    """Find the minimum rule-change plan aligning a saved version with observations.
+
+    Each observation (1–20 of them) pairs an IPv4/IPv6 address with the action
+    (``permit``/``deny``) the policy should take on it.  Each of 1–8 distinct,
+    existing candidate ``rule_id`` values may be kept, disabled (removed from
+    the recomputed ruleset) or flipped (its action inverted).  The endpoint
+    enumerates the combinations under the version's longest-prefix +
+    same-prefix-priority semantics and returns the plan changing the fewest
+    rules (then the fewest disables, then the lexicographically smallest
+    ``(rule_id, operation)`` sequence) that makes every observation resolve to
+    its expected action.  An observation no surviving rule covers is a miss —
+    never an implicit permit.  When nothing works, ``plan`` is ``null``; when
+    the version already agrees with every observation, the plan is empty.
+    Read-only: nothing is persisted and the saved version is never modified.
+    """
+    base = db.get_analysis(analysis_id)
+    if base is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
+
+    return correct_observations(
+        base,
+        [r.model_dump() for r in req.observations],
+        list(req.candidate_rule_ids),
+    )
 
 
 @app.get("/api/analyses/{analysis_id}/rules")
