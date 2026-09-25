@@ -98,6 +98,7 @@ N 的实际覆盖碎片。
 | POST | `/api/analyses/{id}/merge-precheck` | **双批次变更合并预检**：A、B 两组 add/replace/remove 基于同一基线分别重算，检测结构冲突/地址动作冲突/合并冲突（**不落库**），无冲突时返回合并分析与相对基线差异 |
 | POST | `/api/analyses/{id}/quarantine-plan` | **临时封禁方案预演**：给定严格目标 CIDR 与新规则 ID 前缀，确定性生成 `priority=0` 的 deny 新增规则清单，使目标内全部转为 deny、目标外动作不变（**不落库**） |
 | POST | `/api/analyses/{id}/traffic-audit` | **访问观测归因**：把一批观测到的访问记录（IP + 实际动作 + 可选次数）按 LPM + 同前缀优先级归因到胜出规则，逐条核对一致性并加权汇总（**不落库**） |
+| POST | `/api/analyses/{id}/remediation-plan` | **观测纠偏方案**：提交 1–20 条 IP 与期望动作、1–8 个候选 rule_id，搜索改动规则数最少的"保持/停用/翻转"组合，使全部观测按 LPM + 同前缀优先级重算后命中期望动作（**不落库**） |
 | GET | `/api/analyses` | 列出已保存版本（`limit`/`offset` 分页） |
 | GET | `/api/analyses/{id}` | 取某个版本的完整分析结果 |
 | GET | `/api/analyses/{id}/rules` | 查询规则：`status=active/partial/shadowed`、`action=permit/deny`、`ip=4/6` |
@@ -689,6 +690,103 @@ curl -s -X POST http://localhost:8080/api/analyses/an_e38b58f57faf2325/traffic-a
 
 归因是只读的：重复调用结果完全确定，数据库不新增任何分析版本，发布指针不变。
 
+### 观测纠偏方案（remediation plan）
+
+`POST /api/analyses/{id}/remediation-plan` 在**已保存版本**之上求解一个最小的"纠偏"方案：
+提交一批**观测**（IP + 该地址**应当**解析到的动作）和一组**候选规则**，服务端在候选规则上
+搜索"保持 / 停用 / 翻转"的组合，使**全部观测**按该版本现有的**最长前缀匹配（LPM）+
+同前缀优先级**重算后都命中期望动作。与 traffic-audit 一样，本端点**只读取该版本已保存的
+规则**：不新建分析版本、不写库、不修改基线。
+
+请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `observations` | **1–20 条**观测，每条为 `{"ip": "...", "action": "..."}`：`ip` 是单个 IPv4/IPv6 **地址**（不带前缀长度），`action` 是期望动作 `permit`/`deny`（别名同规则，大小写不敏感） |
+| `candidates` | **1–8 个互异**的候选 `rule_id`，必须**存在**于该版本；只有候选规则允许被改动 |
+
+每条候选规则在方案中恰好取三种操作之一：
+
+- `keep`（保持）：不改动（不计入改动数）；
+- `disable`（停用）：把该规则从规则集中移除——更长前缀的幸存规则、然后是更短前缀的祖先
+  会接管它的范围；
+- `flip`（翻转）：仅把动作 permit↔deny 取反，CIDR、`priority`、`source_tag` 与原位置不变。
+
+重算语义与访问观测归因完全一致（**绝不按提交顺序取第一条命中**）：最长前缀胜出，同 CIDR
+并列按 `priority`（数字小者）再按原提交顺序。观测**命中期望**当且仅当重算后**确有规则
+胜出**且其（可能被翻转的）动作等于期望动作——**未命中（`none`）不能视为 permit，也不能
+视为 deny**，因此停用唯一覆盖某地址的规则绝不会"满足"一个 permit 期望。
+
+方案选择（按序）：
+
+1. **改动规则数最少**（`disable` + `flip` 的数量）；
+2. 并列时**停用数最少**（能翻转就不停用）；
+3. 再并列时取 **`(rule_id, operation)` 序列字典序最小**的方案（按 `rule_id` 排序后逐对比较，
+   `"disable" < "flip"`）。
+
+候选至多 8 条，搜索空间以 3⁸ 为界，按改动数分层枚举，第一个存在可行方案的层即最优。
+**原本全部符合**时返回**空方案**（`operations: []`、`changed_rules: 0`，仍逐条给出重算结果）；
+**无解**时 `solved: false` 且 **`plan` 为 `null`**。
+
+```bash
+curl -s -X POST http://localhost:8080/api/analyses/an_e38b58f57faf2325/remediation-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "observations": [
+      {"ip": "10.10.2.9", "action": "permit"},
+      {"ip": "10.10.1.7", "action": "deny"}
+    ],
+    "candidates": ["r2", "r3"]
+  }'
+```
+
+以上文 `dc-2026-09` 版本（`permit 10.0.0.0/8 → deny 10.10.0.0/16 → permit 10.10.1.0/24`）
+为例：`10.10.2.9` 当前被 r2 拒绝、`10.10.1.7` 当前被 r3 放行，各翻转一次即可同时纠偏。
+响应：
+
+```json
+{
+  "analysis_id": "an_e38b58f57faf2325",
+  "ruleset_hash": "e38b58f5...",
+  "analyzer_version": "1.0.0",
+  "observation_count": 2,
+  "candidates": ["r2", "r3"],
+  "solved": true,
+  "plan": {
+    "operations": [
+      {"rule_id": "r2", "operation": "flip", "cidr": "10.10.0.0/16",
+       "from_action": "deny", "to_action": "permit"},
+      {"rule_id": "r3", "operation": "flip", "cidr": "10.10.1.0/24",
+       "from_action": "permit", "to_action": "deny"}
+    ],
+    "changed_rules": 2,
+    "disabled_rules": 0,
+    "flipped_rules": 2,
+    "observations": [
+      {"seq": 0, "ip": "10.10.2.9", "ip_version": 4, "expected_action": "permit",
+       "winner_rule_id": "r2", "action": "permit", "satisfied": true},
+      {"seq": 1, "ip": "10.10.1.7", "ip_version": 4, "expected_action": "deny",
+       "winner_rule_id": "r3", "action": "deny", "satisfied": true}
+    ]
+  }
+}
+```
+
+`operations` 按 `rule_id` 排序；`disable` 操作的 `to_action` 为 `null`。`plan.observations`
+按请求顺序逐条给出**重算后**的胜出规则 `winner_rule_id` 与动作 `action`（返回的方案保证
+全部 `satisfied: true`）。
+
+错误码：
+
+- 任一观测 `ip` 非法、候选 `rule_id` 重复或不存在 → **整批拒绝** `400`，形如
+  `{"error": "invalid_remediation", "detail": "...", "issues": ["observation #2: ...", "..."]}`
+  （`issues` 一次性列出全部问题，观测问题在前、候选问题在后）；
+- 字段层面错误（观测数不在 1–20、候选数不在 1–8、未知动作、空字符串、缺字段、多余字段等）
+  → `422`；
+- 版本不存在 → `404`。
+
+纠偏是只读的：重复调用结果完全确定，数据库不新增任何分析版本，发布指针不变。
+
 ### 已保存版本的 CIDR 决策地图（decision map）
 
 针对**已保存版本**（不会新建分析、不写库），给定一个严格的 IPv4/IPv6 CIDR 查询
@@ -1069,6 +1167,9 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
   （存在 `priority=0` 单地址阻碍时不是错误：返回 `200` 且 `generated: false`）
 - 访问观测批次中存在非法 IP（语法错误、带前缀长度等）→ **整批拒绝** `400`，形如
   `{"error": "invalid_traffic_audit", "detail": "...", "issues": ["record #2: invalid IP address ..."]}`
+- 观测纠偏请求中存在非法观测 IP、候选 rule_id 重复或不存在 → **整批拒绝** `400`，形如
+  `{"error": "invalid_remediation", "detail": "...", "issues": ["observation #1: invalid IP address ...", "..."]}`
+  （无可行方案不是错误：返回 `200` 且 `solved: false`、`plan: null`）
 - 发布指针的 `expected_revision` 与当前 revision 不一致（并发发布冲突）→ `409`，形如
   `{"error": "revision_conflict", "detail": "...", "current": {"active_id": "...", "revision": 2}}`
 - 字段类型/取值错误（未知 action、空规则列表、多余字段、缺少必填查询参数等）→ `422`（Pydantic 校验错误）
@@ -1091,6 +1192,7 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 │   ├── merge_precheck.py # 双批次合并预检：两侧分别重算 + 改变范围精确叠加 + A 后 B 合并重算（纯函数，可独立使用）
 │   ├── quarantine_plan.py # 临时封禁方案：决策分块 + p0 同网段细分 + 真实分析/语义差异复核（纯函数，可独立使用）
 │   ├── traffic_audit.py   # 访问观测归因：单地址 LPM 裁决 + 一致性核对 + 加权汇总（纯函数，可独立使用）
+│   ├── remediation.py     # 观测纠偏方案：候选规则保持/停用/翻转分层搜索 + 逐观测重算（纯函数，可独立使用）
 │   ├── schemas.py       # Pydantic v2 请求/响应模型
 │   ├── db.py            # SQLite 持久层（analyses / rules / findings / active_pointer / active_history 五表）
 │   └── main.py          # FastAPI 路由
@@ -1104,6 +1206,7 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 ├── tests/test_merge_precheck.py # 双批次合并预检端点测试
 ├── tests/test_quarantine_plan.py # 临时封禁方案端点测试（细分、阻碍网段、ID 撞号、IPv6）
 ├── tests/test_traffic_audit.py  # 访问观测归因端点测试（LPM 归因、并列裁决、未覆盖、加权汇总、IPv6）
+├── tests/test_remediation.py    # 观测纠偏端点测试（最小改动、翻转优先、未命中不算 permit、无解/空方案、校验、IPv6）
 ├── requirements.txt
 ├── Dockerfile          # 非 root 运行、内置 HEALTHCHECK、暴露 8080
 ├── docker-compose.yml  # 单命令启动 + 命名卷持久化

@@ -222,6 +222,63 @@ class TrafficAuditRequest(BaseModel):
     )
 
 
+class ObservationIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ip: str = Field(
+        ..., description="IPv4/IPv6 address of the observation (a plain address, no prefix length)"
+    )
+    action: str = Field(
+        ..., description="Expected action: permit/allow or deny/block/drop/reject"
+    )
+
+    @field_validator("action")
+    @classmethod
+    def _normalize_action(cls, v: str) -> str:
+        try:
+            return normalize_action(v)
+        except ValidationError as exc:
+            # Pydantic turns ValueError into a 422 validation error response.
+            raise ValueError(str(exc)) from exc
+
+    @field_validator("ip")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be empty")
+        return v
+
+
+class RemediationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    observations: list[ObservationIn] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description="1-20 observations: an IP address and the action it should resolve to",
+    )
+    candidates: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=8,
+        description="1-8 distinct rule_ids of the saved version that may be "
+        "disabled or flipped",
+    )
+
+    @field_validator("candidates")
+    @classmethod
+    def _strip_candidates(cls, v: list[str]) -> list[str]:
+        stripped = []
+        for item in v:
+            item = item.strip()
+            if not item:
+                raise ValueError("candidate rule_ids must not be empty")
+            stripped.append(item)
+        return stripped
+
+
 class ActivateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

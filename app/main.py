@@ -7,6 +7,7 @@ POST   /api/analyses/{id}/simulate           preview add/replace/remove changes 
 POST   /api/analyses/{id}/merge-precheck     precheck merging two change batches on one base version
 POST   /api/analyses/{id}/quarantine-plan    deterministic deny-rule plan that quarantines one CIDR (preview only)
 POST   /api/analyses/{id}/traffic-audit      attribute observed access records to winning rules (read-only)
+POST   /api/analyses/{id}/remediation-plan   cheapest disable/flip plan making all observations match (read-only)
 GET    /api/analyses                         list saved analysis versions
 GET    /api/analyses/{id}                    fetch one version with the full result
 GET    /api/analyses/{id}/rules              query rules (filters: status/action/ip_version)
@@ -41,12 +42,14 @@ from .diff import ANALYSIS_ID_RE, diff_analyses
 from .merge_precheck import build_batch, merge_precheck
 from .quarantine_plan import QuarantinePlanError, plan_quarantine
 from .redundant import redundant_rule_inventory
+from .remediation import RemediationError, plan_remediation
 from .schemas import (
     ActivateRequest,
     AnalyzeRequest,
     ChangeGuardRequest,
     MergePrecheckRequest,
     QuarantinePlanRequest,
+    RemediationRequest,
     SimulateRequest,
     TrafficAuditRequest,
 )
@@ -114,6 +117,16 @@ async def _traffic_audit_error_handler(_request, exc: TrafficAuditError):
     return JSONResponse(
         status_code=400,
         content={"error": "invalid_traffic_audit", "detail": str(exc), "issues": exc.issues},
+    )
+
+
+@app.exception_handler(RemediationError)
+async def _remediation_error_handler(_request, exc: RemediationError):
+    # The whole request is rejected; every offending observation/candidate is
+    # reported at once.
+    return JSONResponse(
+        status_code=400,
+        content={"error": "invalid_remediation", "detail": str(exc), "issues": exc.issues},
     )
 
 
@@ -320,6 +333,41 @@ def traffic_audit_records(analysis_id: str, req: TrafficAuditRequest) -> dict[st
         raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
 
     return audit_traffic(base, [r.model_dump() for r in req.records])
+
+
+@app.post("/api/analyses/{analysis_id}/remediation-plan", status_code=200)
+def remediation_plan(analysis_id: str, req: RemediationRequest) -> dict[str, Any]:
+    """Plan the cheapest candidate-rule changes that fix every observation.
+
+    The request carries 1-20 **observations** (an IPv4/IPv6 address and the
+    action it *should* resolve to, ``permit``/``deny``) and 1-8 distinct
+    **candidate** rule_ids of the saved version.  Each candidate may be kept,
+    **disabled** (removed from the ruleset) or **flipped** (action toggled,
+    CIDR/priority/position kept).  Every operation set is scored by
+    recomputing each observed address under the version's longest-prefix +
+    same-CIDR-priority semantics; an observation is satisfied only when a
+    rule actually wins with the expected action — an unmatched address
+    (``none``) is never treated as ``permit`` (nor as ``deny``).
+
+    The chosen plan changes the **fewest rules**; ties go to the fewest
+    disables, then to the lexicographically smallest ``(rule_id, operation)``
+    sequence.  The response carries the selected operations and, per
+    observation, the recomputed winning rule and action.  When the unmodified
+    ruleset already satisfies every observation the plan is empty
+    (``operations: []``); when no operation set can satisfy them all,
+    ``plan`` is ``null``.  Any invalid IP, duplicated candidate or unknown
+    candidate rule_id rejects the whole request with ``400``.  Read-only:
+    nothing is persisted and the saved version is never modified.
+    """
+    base = db.get_analysis(analysis_id)
+    if base is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
+
+    return plan_remediation(
+        base,
+        [o.model_dump() for o in req.observations],
+        req.candidates,
+    )
 
 
 @app.get("/api/analyses/{analysis_id}/rules")
